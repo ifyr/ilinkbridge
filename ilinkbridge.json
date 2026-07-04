@@ -1,0 +1,16 @@
+{
+  "ilinkbridge": {
+    "uploads": "/home/ubuntu/uploads",
+    "token": ""
+  },
+  "openclaw": {
+    "command": ["openclaw"],
+    "agent": "main"
+  },
+  "sessions": {
+    "main": {
+      "session-id": "",
+      "comment": "OpenClaw默认"
+    }
+  }
+}

@@ -1,16 +1,23 @@
 {
-  "ilinkbridge": {
-    "uploads": "/home/ubuntu/uploads",
+  "bridge": {
+    "uploads": "~/uploads",
     "token": ""
   },
-  "openclaw": {
-    "command": ["openclaw"],
-    "agent": "main"
+  "opencode": {
+    "server": "http://localhost:4096",
+    "timeout": 600,
+    "password": "your password"
+  },
+  "exec": {
+    "cwd": "~",
+    "timeout": 600
   },
   "sessions": {
-    "main": {
+    "default": {
       "session-id": "",
-      "comment": "OpenClaw默认"
+      "comment": "默认对话",
+      "mode": "plan",
+      "workspace": "~"
     }
   }
 }

@@ -1,13 +1,15 @@
-"""ILinkBridge — WeChat iLink 多 Session 桥接
+"""iLinkBridge — WeChat iLink 多 Session 桥接
 
-独立 asyncio 进程，通过 subprocess CLI 与 OpenClaw 通信。session 动态创建，独立上下文。
+独立 asyncio 进程，通过 subprocess CLI 与 OpenCode 通信。session 动态创建，独立上下文。
 """
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
 import os
 import re
+import shlex
 import struct
 import sys
 import urllib.parse
@@ -48,8 +50,9 @@ def _find_latest_account_token() -> str:
 def _load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
         cfg = {
-            "ilinkbridge": {"uploads": os.path.expanduser("~/uploads"), "token": ""},
-            "openclaw": {"command": ["openclaw"], "agent": "main"},
+            "bridge": {"uploads": os.path.expanduser("~/uploads"), "token": ""},
+            "opencode": {"server": "http://localhost:4096", "timeout": 600, "password": "mypass"},
+            "exec": {"cwd": os.path.expanduser("~"), "timeout": 600},
             "sessions": {},
         }
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -57,60 +60,77 @@ def _load_config() -> dict:
 
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
-    if not cfg.get("ilinkbridge", {}).get("token"):
+    if not cfg.get("bridge", {}).get("token"):
         token = _find_latest_account_token()
         if token:
-            cfg.setdefault("ilinkbridge", {})["token"] = token
+            cfg.setdefault("bridge", {})["token"] = token
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
-            print("[ILinkBridge] 已从 accounts 目录自动获取 ilinkbridge.token", flush=True)
-        else:
-            print("[ILinkBridge] 缺少 ilinkbridge.token，请检查 ilinkbridge.json", flush=True)
-            sys.exit(1)
+            print("[Bridge] 已从 accounts 目录自动获取 bridge.token", flush=True)
     return cfg
 
 
 def _save_config():
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump({
-            "ilinkbridge": CONFIG.get("ilinkbridge", {}),
-            "openclaw": CONFIG.get("openclaw", {}),
-            "sessions": CONFIG.get("sessions", {}),
+            "bridge": CONFIG.get("bridge", {}),
+            "opencode": CONFIG.get("opencode", {}),
+            "exec": CONFIG.get("exec", {}),
+            "sessions": dict(CONFIG.get("sessions", {})),
         }, f, indent=2, ensure_ascii=False)
 
 
 CONFIG = _load_config()
-_IL_TOKEN = CONFIG["ilinkbridge"]["token"]
-_MEDIA_DIR = CONFIG["ilinkbridge"]["uploads"]
+_IL_TOKEN = CONFIG["bridge"]["token"]
+_UPLOAD_DIR = os.path.expanduser(CONFIG["bridge"]["uploads"])
 
-_OC_CMD = CONFIG["openclaw"]["command"]
-_OC_AGENT = CONFIG["openclaw"]["agent"]
+_OP_SERVER = CONFIG["opencode"]["server"].rstrip("/")
+_OP_HTTP_TIMEOUT = int(CONFIG.get("opencode", {}).get("timeout", 600))
+_OP_PASSWORD = CONFIG.get("opencode", {}).get("password", "")
+
+_EXEC_CWD = os.path.expanduser(CONFIG.get("exec", {}).get("cwd") or "~")
+_EXEC_TIMEOUT = int(CONFIG.get("exec", {}).get("timeout", 600))
 
 # Session 管理
 sessions = CONFIG.setdefault("sessions", {})
-if "main" not in sessions:
-    sessions["main"] = {"comment": ""}
+if "default" not in sessions:
+    sessions["default"] = {"comment": "默认对话", "mode": "plan", "workspace": ""}
 
-changed = False
-for name, cfg in sessions.items():
-    if not cfg.get("session-id"):
-        cfg["session-id"] = str(uuid.uuid4())
-        changed = True
-        print(f"[ILinkBridge] session {name} session-id 已生成", flush=True)
-
-if changed:
-    _save_config()
+for name in sessions:
+    cfg = sessions[name]
+    if "mode" not in cfg:
+        cfg["mode"] = "plan"
 
 _SESSIONS = sessions
-_current_session = "main"
+_current_session = "default"
 
-
-def _current_full_session_key() -> str:
-    return f"agent:{_OC_AGENT}:{_current_session}"
+# ─── Session 管理函数 ──────────────────────────────────────────
+def _display_sessions() -> list[str]:
+    lines = ["Session列表："]
+    for name in _SESSIONS:
+        cfg = _SESSIONS[name]
+        line = f"- {name}"
+        parts = []
+        if cfg.get("comment"):
+            parts.append(cfg["comment"])
+        if cfg.get("workspace"):
+            parts.append(cfg["workspace"])
+        if parts:
+            line += " — " + " — ".join(parts)
+        if name == _current_session:
+            line += "【当前】"
+        lines.append(line)
+    return lines
 
 
 def _current_session_id() -> str:
-    return _SESSIONS[_current_session]["session-id"]
+    return _SESSIONS.get(_current_session, {}).get("session-id", "")
+
+
+def _get_workspace(name=None) -> str:
+    """从 session 配置读 workspace，支持 ~ 路径。"""
+    name = name or _current_session
+    return os.path.expanduser(_SESSIONS.get(name, {}).get("workspace", ""))
 
 # ─── 常量 ──────────────────────────────────────────────────────
 BASE_URL = "https://ilinkai.weixin.qq.com/"
@@ -119,7 +139,7 @@ CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 ILINK_APP_ID = "bot"
 ILINK_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 4)  # 2.4.4
 CHANNEL_VERSION = "2.4.4"
-BOT_AGENT = "OpenClaw"
+BOT_AGENT = "OpenCode"
 
 # MessageItemType (official)
 _TYP_NONE, _TEXT, _IMAGE, _VOICE, _FILE, _VIDEO = 0, 1, 2, 3, 4, 5
@@ -134,7 +154,7 @@ _TYPING_TICKETS: dict[str, str] = {}
 _TYPING_USERS: dict[str, float] = {}
 _TYPING_LAST_SENT: dict[str, float] = {}
 
-_ACTIVE_OPENCLAW_TASKS: dict[str, tuple[asyncio.subprocess.Process, asyncio.Task, str]] = {}
+_ACTIVE_REQUEST: dict[str, asyncio.Task] = {}
 
 MSG_CHUNK_SIZE = 4000  # WeChat single message character limit
 
@@ -299,7 +319,7 @@ async def _download_and_decrypt(
 
 # ─── 保存到 workspace ──────────────────────────────────────────
 def _save_media(buf: bytes, subdir: str, filename_hint: str = "media", ext: str = "") -> str:
-    dest_dir = os.path.join(_MEDIA_DIR, subdir)
+    dest_dir = os.path.join(_UPLOAD_DIR, subdir)
     os.makedirs(dest_dir, exist_ok=True)
     unique = hashlib.md5(buf[:1024]).hexdigest()[:12]
     base = os.path.splitext(filename_hint)[0] or "media"
@@ -437,177 +457,141 @@ async def send_message(client: httpx.AsyncClient, to_user_id: str, text: str, co
         await _send_single(client, to_user_id, chunk, context_token)
 
 
-# ─── OpenClaw 转发 ────────────────────────────────────────────────
+# ─── /exec 命令执行 ──────────────────────────────────────────
+async def _exec_command(command: str) -> str:
+    """执行命令，返回 stdout+stderr 拼接。"""
+    if not command or not command.strip():
+        return "(empty command)"
+    try:
+        cmd = shlex.split(command)
+    except ValueError as e:
+        return f"命令解析错误: {e}"
 
-async def _compact_openclaw_session(user_id: str = "") -> str:
-    key = _current_full_session_key()
-
-    cmd = _OC_CMD + [
-        "sessions", "compact",
-        key,
-        "--agent", _OC_AGENT,
-        "--json",
-        "--timeout", "180000",
-    ]
-
-    print(f"[iLink] 压缩 session: {key}", flush=True)
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=_EXEC_CWD,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=190,
-        )
-        if proc.returncode == 0:
-            result = stdout.decode(errors="replace").strip()
-            print(f"[iLink] Session 压缩成功: {result[:120]}", flush=True)
-            return "Session 压缩完成。上下文已释放。"
-        else:
-            err = stderr.decode(errors="replace")[:500]
-            if "gateway" in err.lower() or "1008" in err or "pairing" in err.lower():
-                print(f"[iLink] Gateway 不可达，降级为 max-lines 截断", flush=True)
-                return await _truncate_openclaw_session(key)
-            print(f"[iLink] Session 压缩失败: {err}", flush=True)
-            return f"Session 压缩失败: {err[:200]}"
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_EXEC_TIMEOUT)
     except asyncio.TimeoutError:
-        print("[iLink] Session 压缩超时", flush=True)
-        return "Session 压缩超时（3分钟），请稍后重试。"
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return f"(timeout after {_EXEC_TIMEOUT}s)"
+    except FileNotFoundError:
+        return f"命令未找到: {cmd[0]}"
     except Exception as e:
-        print(f"[iLink] Session 压缩异常: {e}", flush=True)
-        return f"Session 压缩异常: {e}"
+        return f"执行异常: {e}"
+
+    out = stdout.decode(errors="replace")
+    err = stderr.decode(errors="replace")
+    parts = []
+    if proc.returncode != 0:
+        parts.append(f"(退出码 {proc.returncode})")
+    if out.strip():
+        parts.append(out.strip())
+    if err.strip():
+        parts.append(f"[stderr]\n{err.strip()}")
+    return "\n".join(parts) or "(no output)"
 
 
-async def _truncate_openclaw_session(key: str) -> str:
-    cmd = _OC_CMD + [
-        "sessions", "compact",
-        key,
-        "--agent", _OC_AGENT,
-        "--max-lines", "200",
-        "--json",
-    ]
+# ─── OpenCode HTTP API ──────────────────────────────────────────
+
+def _opencode_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if _OP_PASSWORD:
+        import base64
+        token = base64.b64encode(f"opencode:{_OP_PASSWORD}".encode()).decode()
+        headers["Authorization"] = f"Basic {token}"
+    return headers
+
+
+async def _post_opencode_message(sid: str, text: str, user_id: str, ctx_token: str):
+    """向 OpenCode server 发消息，解析 parts，分开发【思考过程】和【最终回复】到微信。"""
+    cfg = _SESSIONS.get(_current_session, {})
+    agent = "plan" if cfg.get("mode") == "plan" else "build"
+
+    body = {
+        "parts": [{"type": "text", "text": text}],
+        "model": {"providerID": "deepseek", "modelID": "deepseek-v4-flash"},
+        "agent": agent,
+    }
+
+    # 启动 typing indicator
+    _TYPING_USERS[user_id] = time.time()
+    async with httpx.AsyncClient() as typer:
+        try:
+            await _send_typing(typer, user_id, 1)
+            _TYPING_LAST_SENT[user_id] = time.time()
+        except Exception:
+            pass
+
+    print(f"[iLink] → OpenCode (agent={agent}): {text[:60]}", flush=True)
+
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        if proc.returncode == 0:
-            print("[iLink] Session 截断成功（max-lines=200）", flush=True)
-            return "Session 已截断（保留最近 200 行），上下文已释放。"
-        else:
-            err = stderr.decode(errors="replace")[:300]
-            print(f"[iLink] Session 截断也失败: {err}", flush=True)
-            return "Session 压缩和截断均失败，请手动管理 session。"
-    except Exception as e:
-        return f"Session 截断异常: {e}"
+        async with httpx.AsyncClient() as http:
+            try:
+                resp = await http.post(
+                    f"{_OP_SERVER}/session/{sid}/message",
+                    params={"directory": _get_workspace()},
+                    headers=_opencode_headers(),
+                    json=body,
+                    timeout=_OP_HTTP_TIMEOUT,
+                )
+            except httpx.TimeoutException:
+                print("[iLink] OpenCode 超时", flush=True)
+                await send_message(http, user_id, "OpenCode 响应超时", ctx_token)
+                return
+            except Exception as e:
+                print(f"[iLink] OpenCode 请求异常: {e}", flush=True)
+                await send_message(http, user_id, f"OpenCode 异常: {e}", ctx_token)
+                return
 
+            if resp.status_code != 200:
+                err_text = f"OpenCode 错误 (HTTP {resp.status_code})"
+                print(f"[iLink] {err_text}", flush=True)
+                await send_message(http, user_id, err_text, ctx_token)
+                return
 
-async def _forward_to_openclaw(user_id: str, text: str, ctx_token: str = "") -> str:
-    if not text or not text.strip():
-        return ""
+            data = resp.json()
 
-    print(f"[iLink] → OpenClaw: {text[:60]}", flush=True)
+        print(f"[iLink] OpenCode ← parts={len(data.get('parts',[]))}", flush=True)
 
-    cmd = _OC_CMD + [
-        "agent",
-        "--agent", _OC_AGENT,
-        "--session-key", _current_full_session_key(),
-        "--session-id", _current_session_id(),
-        "--message", text,
-        "--json",
-    ]
+        async with httpx.AsyncClient() as send_client:
+            has_output = False
+            for part in data.get("parts", []):
+                if part.get("type") == "text":
+                    text = part.get("text", "")
+                    if text:
+                        has_output = True
+                        for chunk in _split_text(text):
+                            await send_message(send_client, user_id, chunk, ctx_token)
+                            await asyncio.sleep(0.2)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+            if not has_output:
+                await send_message(send_client, user_id, "【回复】\n(空响应)", ctx_token)
 
-    task = asyncio.create_task(_handle_openclaw_result(user_id, proc, text, ctx_token))
-    _ACTIVE_OPENCLAW_TASKS[user_id] = (proc, task, ctx_token)
-    return "_PENDING_"
-
-
-async def _handle_openclaw_result(user_id: str, proc: asyncio.subprocess.Process, user_text: str = "", ctx_token: str = ""):
-    reply = ""
-    try:
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace")[:500]
-            out = stdout.decode(errors="replace")[:200]
-            print(f"[iLink] OpenClaw 错误 (code={proc.returncode}): {err}", flush=True)
-            reply = f"OpenClaw 退出码 {proc.returncode}"
-            if err:
-                reply += f"\n{err}"
-            elif out:
-                reply += f"\n{out}"
-        else:
-            raw = stdout.decode(errors="replace").strip()
-            if not raw:
-                reply = "OpenClaw 返回空"
-            else:
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    reply = raw
-                else:
-                    if "payloads" in data and isinstance(data["payloads"], list) and len(data["payloads"]) > 0:
-                        reply = data["payloads"][0].get("text", "")
-                    if not reply:
-                        payloads = data.get("result", {}).get("payloads", [])
-                        if isinstance(payloads, list) and len(payloads) > 0:
-                            reply = payloads[0].get("text", "")
-                    if not reply:
-                        reply = data.get("text", "") or data.get("response", "") or data.get("reply", "")
-                    if not reply:
-                        reply = raw
-                if reply:
-                    print(f"[iLink] OpenClaw ←: {reply[:60]}", flush=True)
     except asyncio.CancelledError:
-        print(f"[iLink] OpenClaw 请求被取消", flush=True)
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        _TYPING_USERS.pop(user_id, None)
-        _TYPING_LAST_SENT.pop(user_id, None)
-        async with httpx.AsyncClient() as client:
-            _cancel_typing(client, user_id)
-            await send_message(client, user_id, "OpenClaw 请求已取消", ctx_token)
-        _ACTIVE_OPENCLAW_TASKS.pop(user_id, None)
-        return
-    except asyncio.TimeoutError:
-        print(f"[iLink] OpenClaw 超时", flush=True)
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        reply = "OpenClaw 响应超时"
-    except Exception as e:
-        print(f"[iLink] OpenClaw 异常: {e}", flush=True)
-        reply = f"OpenClaw 异常: {e}"
-
-    async with httpx.AsyncClient() as client:
-        _cancel_typing(client, user_id)
-        if reply:
-            await send_message(client, user_id, reply, ctx_token)
-        else:
-            await send_message(client, user_id, "OpenClaw 未响应，请稍后重试", ctx_token)
-
-    _ACTIVE_OPENCLAW_TASKS.pop(user_id, None)
-
+        print(f"[iLink] OpenCode 请求被取消", flush=True)
+        async with httpx.AsyncClient() as c:
+            _cancel_typing(c, user_id)
+            await send_message(c, user_id, "已取消", ctx_token)
+        raise
+    finally:
+        _ACTIVE_REQUEST.pop(user_id, None)
+        async with httpx.AsyncClient() as c:
+            _cancel_typing(c, user_id)
 
 # ─── Process ───────────────────────────────────────────────────
 async def _renew_typing(client: httpx.AsyncClient):
-    """续期 typing indicator（每 12s）。"""
+    """续期 typing indicator（每 10s）。"""
     now = time.time()
     for uid in list(_TYPING_USERS.keys()):
         last = _TYPING_LAST_SENT.get(uid, 0)
-        if now - last >= 12:
+        if now - last >= 10:
             try:
                 await _send_typing(client, uid, 1)
                 _TYPING_LAST_SENT[uid] = now
@@ -645,72 +629,157 @@ async def process(client: httpx.AsyncClient, msg: dict):
         await send_message(client, to_id, reply, ctx)
         return
 
-    # ── Bridge 内部命令：不消费 pending media，直接处理 ──
+    # ── 命令处理（不消费 pending media）──
     if text.strip().startswith("/"):
         forwarded = text.strip()
 
-        if forwarded == "/compact":
-            result = await _compact_openclaw_session(to_id)
-            print(f"[iLink] /compact: {result}", flush=True)
+        if forwarded.startswith("/exec "):
+            cmd = forwarded[6:].strip()
+            print(f"[iLink] /exec: {cmd[:60]}", flush=True)
+            result = await _exec_command(cmd)
+            print(f"[iLink] /exec ←: {result[:120]}", flush=True)
             await send_message(client, to_id, result, ctx)
             return
 
         if forwarded == "/help":
             lines = [
-                "- /session [name] [comment] — 切换或创建 session",
+                "使用方式：",
+                "- /mode plan — 方案模式（只读，禁用 write/edit/exec/apply_patch）",
+                "- /mode build — 执行模式（全开）",
+                "- /session [name] [comment] [workspace] — 切换或创建 session",
                 "- /compact — 压缩当前 session 上下文",
+                "- /delete — 删除当前 session（default 清空重置）",
+                "- /cancel — 取消当前请求",
+                "- /exec <cmd> — 执行本地命令",
                 "- /help — 显示此帮助",
                 "- 其他消息 — 转发给当前 session",
                 "",
             ]
-            for name in _SESSIONS:
-                cfg = _SESSIONS[name]
-                line = f"- {name}"
-                if cfg.get("comment"):
-                    line += f" — {cfg['comment']}"
-                if name == _current_session:
-                    line += "【当前】"
-                lines.append(line)
+            lines.extend(_display_sessions())
             await send_message(client, to_id, "\n".join(lines), ctx)
             return
 
+        if forwarded == "/compact":
+            sid = _current_session_id()
+            if not sid:
+                await send_message(client, to_id, "当前 session 未关联 OpenCode 会话", ctx)
+                return
+            try:
+                resp = await client.post(
+                    f"{_OP_SERVER}/api/session/{sid}/compact",
+                    params={"directory": _get_workspace()},
+                    headers=_opencode_headers(),
+                    timeout=30,
+                )
+                if resp.status_code == 204:
+                    await send_message(client, to_id, "Session 已压缩", ctx)
+                else:
+                    await send_message(client, to_id, f"压缩失败 (HTTP {resp.status_code})", ctx)
+            except Exception as e:
+                await send_message(client, to_id, f"压缩异常: {e}", ctx)
+            return
+
+        if forwarded == "/cancel":
+            task = _ACTIVE_REQUEST.pop(to_id, None)
+            if task and not task.done():
+                task.cancel()
+                sid = _current_session_id()
+                if sid:
+                    try:
+                        await client.post(f"{_OP_SERVER}/session/{sid}/abort", headers=_opencode_headers(), timeout=10)
+                    except Exception:
+                        pass
+                await send_message(client, to_id, "已取消", ctx)
+            else:
+                await send_message(client, to_id, "当前无进行中的请求", ctx)
+            return
+
+        if forwarded == "/delete":
+            cfg = _SESSIONS.get(_current_session, {})
+            sid = cfg.get("session-id", "")
+
+            if _current_session == "default":
+                if sid:
+                    try:
+                        await client.delete(f"{_OP_SERVER}/session/{sid}", headers=_opencode_headers(), timeout=10)
+                    except Exception:
+                        pass
+                cfg["session-id"] = ""
+                _save_config()
+                await send_message(client, to_id, "默认会话已清空", ctx)
+            else:
+                if sid:
+                    try:
+                        await client.delete(f"{_OP_SERVER}/session/{sid}", headers=_opencode_headers(), timeout=10)
+                    except Exception as e:
+                        await send_message(client, to_id, f"删除失败: {e}", ctx)
+                        return
+                del _SESSIONS[_current_session]
+                _current_session = "default"
+                _save_config()
+                await send_message(client, to_id, f"Session 已删除，已切换到默认会话", ctx)
+            return
+
+        if forwarded == "/mode plan":
+            _SESSIONS.setdefault(_current_session, {})["mode"] = "plan"
+            _save_config()
+            await send_message(client, to_id,
+                "【方案模式】\n禁用：write / edit / apply_patch / exec", ctx)
+            return
+
+        if forwarded == "/mode build":
+            _SESSIONS.setdefault(_current_session, {})["mode"] = "build"
+            _save_config()
+            await send_message(client, to_id,
+                "【执行模式】\n所有工具全开", ctx)
+            return
+
         if forwarded == "/session":
-            lines = []
-            for name in _SESSIONS:
-                cfg = _SESSIONS[name]
-                line = f"- {name}"
-                if cfg.get("comment"):
-                    line += f" — {cfg['comment']}"
-                if name == _current_session:
-                    line += "【当前】"
-                lines.append(line)
+            lines = _display_sessions()
             lines.append("")
-            lines.append("用法: /session <name> [comment]")
+            lines.append("用法: /session <name> [comment] [workspace]")
             await send_message(client, to_id, "\n".join(lines), ctx)
             return
 
         if forwarded.startswith("/session "):
-            parts = forwarded[9:].strip().split(maxsplit=1)
+            parts = forwarded[9:].strip().split(maxsplit=2)
             name = parts[0]
             comment = parts[1] if len(parts) > 1 else ""
+            workspace = parts[2] if len(parts) > 2 else ""
 
             if name not in _SESSIONS:
-                _SESSIONS[name] = {"session-id": str(uuid.uuid4()), "comment": comment}
+                cfg = {"comment": comment, "mode": "plan", "session-id": ""}
+                if workspace:
+                    cfg["workspace"] = workspace
+                _SESSIONS[name] = cfg
                 _save_config()
                 _current_session = name
                 print(f"[iLink] /session 创建: {name}", flush=True)
-                reply = f"已创建并切换到 session {name}"
+                parts_msg = [f"已创建并切换到 session {name}"]
                 if comment:
-                    reply += f" — {comment}"
+                    parts_msg.append(comment)
+                if workspace:
+                    parts_msg.append(f"workspace={workspace}")
+                reply = " — ".join(parts_msg)
             else:
+                cfg = _SESSIONS[name]
+                modified = False
                 if comment:
-                    _SESSIONS[name]["comment"] = comment
+                    cfg["comment"] = comment
+                    modified = True
+                if workspace:
+                    cfg["workspace"] = workspace
+                    modified = True
+                if modified:
                     _save_config()
                 _current_session = name
                 print(f"[iLink] /session: {name}", flush=True)
-                reply = f"已切换到 session {name}"
-                if _SESSIONS[name].get("comment"):
-                    reply += f" — {_SESSIONS[name]['comment']}"
+                parts_msg = [f"已切换到 session {name}"]
+                if cfg.get("comment"):
+                    parts_msg.append(cfg["comment"])
+                if cfg.get("workspace"):
+                    parts_msg.append(f"workspace={cfg['workspace']}")
+                reply = " — ".join(parts_msg)
 
             await send_message(client, to_id, reply, ctx)
             return
@@ -729,34 +798,146 @@ async def process(client: httpx.AsyncClient, msg: dict):
             text = media_str
         msg["text"] = text
 
-    # ── 所有消息 → OpenClaw（当前 session）──
+    # ── Session 路由 ──
     forwarded = text.strip()
     if not forwarded:
         return
 
-    _TYPING_USERS[to_id] = time.time()
-    try:
-        await _send_typing(client, to_id, 1)
-        _TYPING_LAST_SENT[to_id] = time.time()
-    except Exception:
-        pass
-
-    status = await _forward_to_openclaw(to_id, forwarded, ctx)
-    if status == "_PENDING_":
+    sid = _current_session_id()
+    if not sid:
+        await send_message(client, to_id, "当前 session 未关联 OpenCode 会话，请用 /session 切换到有效 session", ctx)
         return
-    elif status:
-        _cancel_typing(client, to_id)
-        await send_message(client, to_id, status, ctx)
-    else:
-        _cancel_typing(client, to_id)
-        await send_message(client, to_id, "OpenClaw 未响应，请稍后重试", ctx)
 
+    task = asyncio.create_task(_post_opencode_message(sid, forwarded, to_id, ctx))
+    _ACTIVE_REQUEST[to_id] = task
+    return
 
 # ─── Main ──────────────────────────────────────────────────────
+
+async def _do_qrcode_login(client: httpx.AsyncClient) -> str:
+    """二维码绑定流程：获取二维码链接 → 输出到 stdout → 轮询结果 → 保存 token。"""
+    global _IL_TOKEN
+
+    print("\n[Bridge] ═══════════════════════════════", flush=True)
+    print("[Bridge]  未检测到 bridge.token，开始二维码绑定", flush=True)
+    print("[Bridge] ═══════════════════════════════\n", flush=True)
+
+    max_refresh = 3
+    bot_type = "3"
+    ilink_base = "https://ilinkai.weixin.qq.com"
+
+    for refresh in range(max_refresh + 1):
+        try:
+            resp = await client.post(
+                f"{ilink_base}/ilink/bot/get_bot_qrcode?bot_type={bot_type}",
+                headers={"Content-Type": "application/json"},
+                json={"local_token_list": []},
+                timeout=30,
+            )
+            qr_data = resp.json()
+        except Exception as e:
+            print(f"[Bridge] 获取二维码失败: {e}", flush=True)
+            return ""
+
+        qrcode_id = qr_data.get("qrcode", "")
+        qrcode_url = qr_data.get("qrcode_img_content", "")
+        if not qrcode_id or not qrcode_url:
+            print(f"[Bridge] 二维码响应异常: {qr_data}", flush=True)
+            return ""
+
+        print(f"[Bridge] 请用手机微信访问以下链接并完成绑定：", flush=True)
+        print(f"{qrcode_url}\n", flush=True)
+
+        deadline = time.time() + 480
+        while time.time() < deadline:
+            try:
+                status_resp = await client.get(
+                    f"{ilink_base}/ilink/bot/get_qrcode_status?qrcode={qrcode_id}",
+                    timeout=35,
+                )
+                sdata = status_resp.json()
+            except Exception:
+                await asyncio.sleep(2)
+                continue
+
+            status = sdata.get("status", "")
+
+            if status == "confirmed":
+                token = sdata.get("bot_token", "")
+                if token:
+                    print(f"[Bridge] ✅ 二维码扫描成功", flush=True)
+                    CONFIG.setdefault("bridge", {})["token"] = token
+                    _IL_TOKEN = token
+                    _save_config()
+                    print(f"[Bridge] bridge.token 已保存", flush=True)
+                    return token
+                print(f"[Bridge] ⚠️ 扫描成功但未返回 bot_token", flush=True)
+                return ""
+
+            if status == "expired":
+                print(f"[Bridge] ⏳ 二维码已过期 ({refresh + 1}/{max_refresh})", flush=True)
+                break
+
+            if status == "binded_redirect":
+                print(f"[Bridge] ✅ 该机器人已绑定过此 OpenClaw，继续使用", flush=True)
+                return ""
+
+            if status in ("need_verifycode", "verify_code_blocked"):
+                print(f"[Bridge] ⚠️ 需要配对码，请在微信中输入配对码", flush=True)
+                await asyncio.sleep(5)
+                continue
+
+            await asyncio.sleep(1)
+        else:
+            print(f"[Bridge] ❌ 二维码登录超时", flush=True)
+            return ""
+
+    print(f"[Bridge] ❌ 二维码多次过期，登录失败", flush=True)
+    return ""
+
+
+async def _ensure_opencode_sessions(client: httpx.AsyncClient):
+    """启动时确保所有非 hongine session 在 OpenCode server 上存在。"""
+    for name, cfg in list(_SESSIONS.items()):
+        if "mode" not in cfg:
+            cfg["mode"] = "plan"
+        sid = cfg.get("session-id", "")
+        if sid and sid.startswith("ses_"):
+            continue
+        try:
+            resp = await client.post(
+                f"{_OP_SERVER}/session",
+                params={"directory": os.path.expanduser(cfg.get("workspace", ""))},
+                headers=_opencode_headers(),
+                json={"title": name},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                new_sid = data.get("id", "")
+                if new_sid:
+                    cfg["session-id"] = new_sid
+                    print(f"[Bridge] session {name} → OpenCode: {new_sid}", flush=True)
+                else:
+                    print(f"[Bridge] 创建 session {name} 失败: 响应无 id", flush=True)
+            else:
+                print(f"[Bridge] 创建 session {name} 失败: HTTP {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"[Bridge] 创建 session {name} 异常: {e}", flush=True)
+    _save_config()
+
+
 async def main():
-    print("[ILinkBridge] WeChat 桥接就绪", flush=True)
+    print("[iLinkBridge] WeChat 桥接就绪", flush=True)
     buf = ""
     async with httpx.AsyncClient() as client:
+        if not _IL_TOKEN:
+            token = await _do_qrcode_login(client)
+            if not token:
+                print("[Bridge] ❌ 无法获取 bridge.token，退出", flush=True)
+                sys.exit(1)
+
+        await _ensure_opencode_sessions(client)
         while True:
             try:
                 await _renew_typing(client)
